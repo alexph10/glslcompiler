@@ -21,34 +21,56 @@ pub enum LexError {
 }
     
 /// Lexer for tokenizing pixdsl source code
-pub struct Lexer<'a> {
-    input: &'a str,
+/// 
+/// Uses zero-copy string slicing and iterator-based design for efficiency
+pub struct Lexer<'input> {
+    input: &'input str,
+    chars: std::str::CharIndices<'input>,
+    current: Option<(usize, char)>,
     position: usize,
-    current_char: Option<char>,
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str) -> Self {
-        let mut lexer = Self {
+impl<'input> Lexer<'input> {
+    /// Create a new lexer for the given input
+    /// 
+    /// # Examples
+    /// ```
+    /// use GLSLCompiler::lexer::Lexer;
+    /// 
+    /// let mut lexer = Lexer::new("let x = 1.0;");
+    /// let tokens: Result<Vec<_>, _> = lexer.collect();
+    /// ```
+    pub fn new(input: &'input str) -> Self {
+        let mut chars = input.char_indices();
+        let current = chars.next();
+        
+        Self {
             input,
-            position: 0,
-            current_char: None,
-        };
-        lexer.current_char = lexer.input.chars().next();
-        lexer
+            chars,
+            current,
+            position: current.map_or(0, |(pos, _)| pos),
+        }
     }
     
+    /// Advance to the next character
     fn advance(&mut self) {
-        self.position += self.current_char.map(|c| c.len_utf8()).unwrap_or(0);
-        self.current_char = self.input.chars().nth(self.position);
+        self.current = self.chars.next();
+        self.position = self.current.map_or(self.input.len(), |(pos, _)| pos);
     }
     
-    fn peek(&self) -> Option<char> {
-        self.input.chars().nth(self.position + 1)
+    /// Peek at the next character without consuming it
+    fn peek_char(&self) -> Option<char> {
+        self.chars.as_str().chars().next()
     }
     
+    /// Get the current character
+    fn current_char(&self) -> Option<char> {
+        self.current.map(|(_, ch)| ch)
+    }
+    
+    /// Skip whitespace characters
     fn skip_whitespace(&mut self) {
-        while let Some(ch) = self.current_char {
+        while let Some((_, ch)) = self.current {
             if ch.is_whitespace() {
                 self.advance();
             } else {
@@ -57,125 +79,127 @@ impl<'a> Lexer<'a> {
         }
     }
     
+    /// Read a number literal with proper validation
+    /// 
+    /// Supports integers and floats, validates format
     fn read_number(&mut self) -> Result<f64, LexError> {
-        let start = self.position;
+        let start_pos = self.position;
+        let mut has_dot = false;
         
-        while let Some(ch) = self.current_char {
-            if ch.is_ascii_digit() || ch == '.' {
-                self.advance();
-            } else {
-                break;
+        // Consume digits and at most one decimal point
+        while let Some((_, ch)) = self.current {
+            match ch {
+                '0'..='9' => self.advance(),
+                '.' if !has_dot => {
+                    has_dot = true;
+                    self.advance();
+                    
+                    // Ensure there's at least one digit after the dot
+                    if !matches!(self.current_char(), Some('0'..='9')) {
+                        return Err(LexError::InvalidNumber {
+                            span: Span::new(start_pos, self.position),
+                        });
+                    }
+                }
+                _ => break,
             }
         }
         
-        let number_str = &self.input[start..self.position];
+        let number_str = &self.input[start_pos..self.position];
         number_str.parse().map_err(|_| LexError::InvalidNumber {
-            span: Span::new(start, self.position),
+            span: Span::new(start_pos, self.position),
         })
     }
     
-    fn read_identifier(&mut self) -> String {
-        let start = self.position;
+    /// Read an identifier with proper validation
+    /// 
+    /// Identifiers must start with letter or underscore,
+    /// followed by letters, digits, or underscores
+    fn read_identifier(&mut self) -> Result<String, LexError> {
+        let start_pos = self.position;
         
-        while let Some(ch) = self.current_char {
-            if ch.is_alphanumeric() || ch == '_' {
+        // First character must be letter or underscore
+        if !matches!(self.current_char(), Some('a'..='z' | 'A'..='Z' | '_')) {
+            return Err(LexError::UnexpectedChar {
+                char: self.current_char().unwrap_or('\0'),
+                span: Span::new(start_pos, self.position),
+            });
+        }
+        
+        // Continue with alphanumeric or underscore
+        while let Some((_, ch)) = self.current {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
                 self.advance();
             } else {
                 break;
             }
         }
         
-        self.input[start..self.position].to_string()
+        Ok(self.input[start_pos..self.position].to_string())
     }
     
+    /// Get the next token from the input
+    /// 
+    /// Returns Ok(Token) or Err(LexError) for invalid input
     pub fn next_token(&mut self) -> Result<Token, LexError> {
         self.skip_whitespace();
         
         let start_pos = self.position;
         
-        match self.current_char {
-            None => Ok(Token::new(TokenType::Eof, Span::new(start_pos, start_pos))),
+        let token_type = match self.current_char() {
+            None => TokenType::Eof,
             
-            Some(ch) => {
-                match ch {
-                    '+' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Plus, Span::new(start_pos, self.position)))
-                    }
-                    '-' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Minus, Span::new(start_pos, self.position)))
-                    }
-                    '*' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Multiply, Span::new(start_pos, self.position)))
-                    }
-                    '/' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Divide, Span::new(start_pos, self.position)))
-                    }
-                    '=' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Assign, Span::new(start_pos, self.position)))
-                    }
-                    '(' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::LeftParen, Span::new(start_pos, self.position)))
-                    }
-                    ')' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::RightParen, Span::new(start_pos, self.position)))
-                    }
-                    '{' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::LeftBrace, Span::new(start_pos, self.position)))
-                    }
-                    '}' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::RightBrace, Span::new(start_pos, self.position)))
-                    }
-                    ',' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Comma, Span::new(start_pos, self.position)))
-                    }
-                    ';' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Semicolon, Span::new(start_pos, self.position)))
-                    }
-                    '.' => {
-                        self.advance();
-                        Ok(Token::new(TokenType::Dot, Span::new(start_pos, self.position)))
-                    }
-                    
-                    '0'..='9' => {
-                        let number = self.read_number()?;
-                        Ok(Token::new(TokenType::Float(number), Span::new(start_pos, self.position)))
-                    }
-                    
-                    'a'..='z' | 'A'..='Z' | '_' => {
-                        let identifier = self.read_identifier();
-                        let token_type = match identifier.as_str() {
-                            "let" => TokenType::Let,
-                            "float" => TokenType::Float32,
-                            "vec2" => TokenType::Vec2,
-                            "vec3" => TokenType::Vec3,
-                            "vec4" => TokenType::Vec4,
-                            _ => TokenType::Identifier(identifier),
-                        };
-                        Ok(Token::new(token_type, Span::new(start_pos, self.position)))
-                    }
-                    
-                    _ => {
-                        let error_char = ch;
-                        let error_span = Span::new(start_pos, self.position + ch.len_utf8());
-                        self.advance(); // Important: advance past the error character
-                        Err(LexError::UnexpectedChar {
-                            char: error_char,
-                            span: error_span,
-                        })
-                    }
-                }
+            // Single-character tokens
+            Some('+') => { self.advance(); TokenType::Plus }
+            Some('-') => { self.advance(); TokenType::Minus }
+            Some('*') => { self.advance(); TokenType::Multiply }
+            Some('/') => { self.advance(); TokenType::Divide }
+            Some('=') => { self.advance(); TokenType::Assign }
+            Some('(') => { self.advance(); TokenType::LeftParen }
+            Some(')') => { self.advance(); TokenType::RightParen }
+            Some('{') => { self.advance(); TokenType::LeftBrace }
+            Some('}') => { self.advance(); TokenType::RightBrace }
+            Some(',') => { self.advance(); TokenType::Comma }
+            Some(';') => { self.advance(); TokenType::Semicolon }
+            Some('.') => { self.advance(); TokenType::Dot }
+            
+            // Number literals
+            Some('0'..='9') => {
+                TokenType::Float(self.read_number()?)
             }
+            
+            // Identifiers and keywords
+            Some('a'..='z' | 'A'..='Z' | '_') => {
+                let identifier = self.read_identifier()?;
+                self.classify_identifier(identifier)
+            }
+            
+            // Invalid characters
+            Some(ch) => {
+                let error_char = ch;
+                let char_end = self.position + ch.len_utf8();
+                self.advance(); // Advance past error to prevent infinite loop
+                
+                return Err(LexError::UnexpectedChar {
+                    char: error_char,
+                    span: Span::new(start_pos, char_end),
+                });
+            }
+        };
+        
+        Ok(Token::new(token_type, Span::new(start_pos, self.position)))
+    }
+    
+    /// Classify an identifier as either a keyword or identifier token
+    #[inline]
+    fn classify_identifier(&self, identifier: String) -> TokenType {
+        match identifier.as_str() {
+            "let" => TokenType::Let,
+            "float" => TokenType::Float32,
+            "vec2" => TokenType::Vec2,
+            "vec3" => TokenType::Vec3,
+            "vec4" => TokenType::Vec4,
+            _ => TokenType::Identifier(identifier),
         }
     }
 }

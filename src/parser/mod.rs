@@ -34,6 +34,15 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Create a new parser from input string
+    /// 
+    /// # Example
+    /// ```
+    /// use GLSLCompiler::parser::Parser;
+    /// let mut parser = Parser::new("let x = 2.0;")?;
+    /// let program = parser.parse()?;
+    /// # Ok::<(), GLSLCompiler::parser::ParseError>(())
+    /// ```
     pub fn new(input: &str) -> Result<Self, ParseError> {
         let lexer = Lexer::new(input);
         let tokens: Result<Vec<_>, _> = lexer.collect();
@@ -48,44 +57,105 @@ impl Parser {
         Ok(parser)
     }
     
+    /// Advance to the next token
+    #[inline]
     fn advance(&mut self) {
         self.current_token = self.tokens.next();
     }
     
+    /// Peek at the next token without consuming it
+    #[inline]
     fn peek(&mut self) -> Option<&Token> {
         self.tokens.peek()
     }
     
+    /// Get the span of the current token, or a default span
+    #[inline]
     fn current_span(&self) -> Span {
         self.current_token
             .as_ref()
             .map(|t| t.span)
-            .unwrap_or(Span::new(0, 0))
+            .unwrap_or_else(|| Span::new(0, 0))
     }
     
+    /// Expect a specific token type and consume it
+    /// 
+    /// Returns the consumed token on success, or an appropriate error
     fn expect_token(&mut self, expected: TokenType) -> Result<Token, ParseError> {
         match &self.current_token {
-            Some(token) if std::mem::discriminant(&token.token_type) == std::mem::discriminant(&expected) => {
+            Some(token) if self.token_matches(&token.token_type, &expected) => {
                 let token = token.clone();
                 self.advance();
                 Ok(token)
             }
             Some(token) => Err(ParseError::UnexpectedToken {
-                expected: format!("{:?}", expected),
+                expected: self.token_description(&expected),
                 found: token.token_type.clone(),
                 span: token.span,
             }),
             None => Err(ParseError::UnexpectedEof {
-                expected: format!("{:?}", expected),
+                expected: self.token_description(&expected),
             }),
         }
     }
     
+    /// Check if two token types match (ignoring values for certain types)
+    #[inline]
+    fn token_matches(&self, found: &TokenType, expected: &TokenType) -> bool {
+        use TokenType::*;
+        match (found, expected) {
+            // Exact matches for most types
+            (Let, Let) | (Float32, Float32) | (Vec2, Vec2) | (Vec3, Vec3) | (Vec4, Vec4) |
+            (Plus, Plus) | (Minus, Minus) | (Multiply, Multiply) | (Divide, Divide) |
+            (Assign, Assign) | (LeftParen, LeftParen) | (RightParen, RightParen) |
+            (LeftBrace, LeftBrace) | (RightBrace, RightBrace) | (Comma, Comma) |
+            (Semicolon, Semicolon) | (Dot, Dot) | (Eof, Eof) => true,
+            
+            // Pattern matching for value-carrying types
+            (Identifier(_), Identifier(_)) => true,
+            (Float(_), Float(_)) => true,
+            
+            _ => false,
+        }
+    }
+    
+    /// Get a human-readable description of a token type
+    #[inline]
+    fn token_description(&self, token_type: &TokenType) -> String {
+        use TokenType::*;
+        match token_type {
+            Let => "keyword 'let'".to_string(),
+            Float32 => "type 'float'".to_string(),
+            Vec2 => "type 'vec2'".to_string(),
+            Vec3 => "type 'vec3'".to_string(),
+            Vec4 => "type 'vec4'".to_string(),
+            Identifier(_) => "identifier".to_string(),
+            Float(_) => "number".to_string(),
+            Plus => "'+'".to_string(),
+            Minus => "'-'".to_string(),
+            Multiply => "'*'".to_string(),
+            Divide => "'/'".to_string(),
+            Assign => "'='".to_string(),
+            LeftParen => "'('".to_string(),
+            RightParen => "')'".to_string(),
+            LeftBrace => "'{'".to_string(),
+            RightBrace => "'}'".to_string(),
+            Comma => "','".to_string(),
+            Semicolon => "';'".to_string(),
+            Dot => "'.'".to_string(),
+            Eof => "end of file".to_string(),
+        }
+    }
+    
+    /// Parse the entire program into an AST
     pub fn parse(&mut self) -> Result<Program, ParseError> {
         let start_span = self.current_span();
         let mut statements = Vec::new();
         
         while self.current_token.is_some() {
+            if let TokenType::Eof = &self.current_token.as_ref().unwrap().token_type {
+                break;
+            }
             statements.push(self.parse_statement()?);
         }
         
@@ -97,24 +167,29 @@ impl Parser {
         Ok(Program::new(statements, Span::new(start_span.start, end_span.end)))
     }
     
+    /// Parse a statement (let declaration or expression statement)
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         match &self.current_token {
             Some(Token { token_type: TokenType::Let, .. }) => {
                 self.parse_let_statement().map(Statement::Let)
             }
-            _ => {
+            Some(_) => {
                 self.parse_expression().map(Statement::Expression)
             }
+            None => Err(ParseError::UnexpectedEof {
+                expected: "statement".to_string(),
+            }),
         }
     }
     
+    /// Parse a let statement: `let identifier = expression;`
     fn parse_let_statement(&mut self) -> Result<LetStatement, ParseError> {
         let start_span = self.current_span();
         
         // Consume 'let'
         self.expect_token(TokenType::Let)?;
         
-        // Get identifier
+        // Get identifier name
         let name = match &self.current_token {
             Some(Token { token_type: TokenType::Identifier(name), .. }) => {
                 let name = name.clone();
@@ -131,13 +206,13 @@ impl Parser {
             }),
         };
         
-        // Expect '='
+        // Expect assignment operator
         self.expect_token(TokenType::Assign)?;
         
-        // Parse value expression
+        // Parse the assigned value
         let value = self.parse_expression()?;
         
-        // Expect ';'
+        // Expect semicolon terminator
         let end_token = self.expect_token(TokenType::Semicolon)?;
         
         Ok(LetStatement {
@@ -147,141 +222,131 @@ impl Parser {
         })
     }
     
+    /// Parse an expression with correct operator precedence
     fn parse_expression(&mut self) -> Result<Expression, ParseError> {
         self.parse_additive()
     }
     
-    // Precedence climbing for binary operators
+    /// Parse additive expressions (+ and -)
     fn parse_additive(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_multiplicative()?;
         
         while let Some(token) = &self.current_token {
-            match &token.token_type {
-                TokenType::Plus => {
-                    self.advance();
-                    let right = self.parse_multiplicative()?;
-                    let span = Span::new(left.span().start, right.span().end);
-                    left = Expression::Binary(BinaryExpression {
-                        left: Box::new(left),
-                        operator: BinaryOperator::Add,
-                        right: Box::new(right),
-                        span,
-                    });
-                }
-                TokenType::Minus => {
-                    self.advance();
-                    let right = self.parse_multiplicative()?;
-                    let span = Span::new(left.span().start, right.span().end);
-                    left = Expression::Binary(BinaryExpression {
-                        left: Box::new(left),
-                        operator: BinaryOperator::Subtract,
-                        right: Box::new(right),
-                        span,
-                    });
-                }
+            let operator = match &token.token_type {
+                TokenType::Plus => BinaryOperator::Add,
+                TokenType::Minus => BinaryOperator::Subtract,
                 _ => break,
-            }
+            };
+            
+            self.advance();
+            let right = self.parse_multiplicative()?;
+            let span = Span::new(left.span().start, right.span().end);
+            
+            left = Expression::Binary(BinaryExpression {
+                left: Box::new(left),
+                operator,
+                right: Box::new(right),
+                span,
+            });
         }
         
         Ok(left)
     }
     
+    /// Parse multiplicative expressions (* and /)
     fn parse_multiplicative(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_primary()?;
         
         while let Some(token) = &self.current_token {
-            match &token.token_type {
-                TokenType::Multiply => {
-                    self.advance();
-                    let right = self.parse_primary()?;
-                    let span = Span::new(left.span().start, right.span().end);
-                    left = Expression::Binary(BinaryExpression {
-                        left: Box::new(left),
-                        operator: BinaryOperator::Multiply,
-                        right: Box::new(right),
-                        span,
-                    });
-                }
-                TokenType::Divide => {
-                    self.advance();
-                    let right = self.parse_primary()?;
-                    let span = Span::new(left.span().start, right.span().end);
-                    left = Expression::Binary(BinaryExpression {
-                        left: Box::new(left),
-                        operator: BinaryOperator::Divide,
-                        right: Box::new(right),
-                        span,
-                    });
-                }
+            let operator = match &token.token_type {
+                TokenType::Multiply => BinaryOperator::Multiply,
+                TokenType::Divide => BinaryOperator::Divide,
                 _ => break,
-            }
+            };
+            
+            self.advance();
+            let right = self.parse_primary()?;
+            let span = Span::new(left.span().start, right.span().end);
+            
+            left = Expression::Binary(BinaryExpression {
+                left: Box::new(left),
+                operator,
+                right: Box::new(right),
+                span,
+            });
         }
         
         Ok(left)
     }
     
+    /// Parse primary expressions (literals, identifiers, function calls, parenthesized expressions)
     fn parse_primary(&mut self) -> Result<Expression, ParseError> {
+        use TokenType::*;
+        
         match &self.current_token {
-            Some(Token { token_type: TokenType::Float(value), span }) => {
-                let value = *value;
-                let span = *span;
+            // Numeric literals
+            Some(Token { token_type: Float(value), span }) => {
+                let literal = Expression::Literal(LiteralExpression {
+                    value: LiteralValue::Float(*value),
+                    span: *span,
+                });
                 self.advance();
-                Ok(Expression::Literal(LiteralExpression {
-                    value: LiteralValue::Float(value),
-                    span,
-                }))
+                Ok(literal)
             }
             
-            Some(Token { token_type: TokenType::Identifier(name), span }) => {
+            // Identifiers (variables or function calls)
+            Some(Token { token_type: Identifier(name), span }) => {
                 let name = name.clone();
-                let span = *span;
+                let start_span = *span;
                 self.advance();
                 
-                // Check if this is a function call
-                if let Some(Token { token_type: TokenType::LeftParen, .. }) = &self.current_token {
-                    self.parse_function_call(name, span)
-                } else {
-                    Ok(Expression::Variable(VariableExpression { name, span }))
-                }
+                self.parse_identifier_or_call(name, start_span)
             }
             
-            Some(Token { token_type: TokenType::Vec2, span }) => {
-                let span = *span;
+            // Built-in vector types
+            Some(Token { token_type, span }) if matches!(token_type, Vec2 | Vec3 | Vec4) => {
+                let function_name = match token_type {
+                    Vec2 => "vec2",
+                    Vec3 => "vec3", 
+                    Vec4 => "vec4",
+                    _ => unreachable!(),
+                }.to_string();
+                let start_span = *span;
                 self.advance();
-                self.parse_function_call("vec2".to_string(), span)
+                
+                self.parse_function_call(function_name, start_span)
             }
             
-            Some(Token { token_type: TokenType::Vec3, span }) => {
-                let span = *span;
-                self.advance();
-                self.parse_function_call("vec3".to_string(), span)
-            }
-            
-            Some(Token { token_type: TokenType::Vec4, span }) => {
-                let span = *span;
-                self.advance();
-                self.parse_function_call("vec4".to_string(), span)
-            }
-            
-            Some(Token { token_type: TokenType::LeftParen, .. }) => {
+            // Parenthesized expressions
+            Some(Token { token_type: LeftParen, .. }) => {
                 self.advance(); // consume '('
                 let expr = self.parse_expression()?;
-                self.expect_token(TokenType::RightParen)?;
+                self.expect_token(RightParen)?;
                 Ok(expr)
             }
             
+            // Error cases
             Some(token) => Err(ParseError::UnexpectedToken {
                 expected: "expression".to_string(),
                 found: token.token_type.clone(),
                 span: token.span,
             }),
-            
             None => Err(ParseError::UnexpectedEof {
                 expected: "expression".to_string(),
             }),
         }
     }
     
+    /// Parse either a variable reference or function call based on lookahead
+    fn parse_identifier_or_call(&mut self, name: String, start_span: Span) -> Result<Expression, ParseError> {
+        if let Some(Token { token_type: TokenType::LeftParen, .. }) = &self.current_token {
+            self.parse_function_call(name, start_span)
+        } else {
+            Ok(Expression::Variable(VariableExpression { name, span: start_span }))
+        }
+    }
+    
+    /// Parse a function call: `function_name(arg1, arg2, ...)`
     fn parse_function_call(&mut self, function_name: String, start_span: Span) -> Result<Expression, ParseError> {
         // Consume '('
         self.expect_token(TokenType::LeftParen)?;

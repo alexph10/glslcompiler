@@ -107,12 +107,12 @@ impl Compiler {
 /// 
 /// # Example
 /// ```
-/// use glslcompiler::{compile, Profile};
+/// use GLSLCompiler::{compile, Profile};
 /// 
 /// let dsl_source = "vec4(1.0, 0.0, 0.0, 1.0)";
 /// let glsl = compile(dsl_source, Profile::Es300)?;
 /// println!("{}", glsl);
-/// # Ok::<(), glslcompiler::CompilerError>(())
+/// # Ok::<(), GLSLCompiler::CompilerError>(())
 /// ```
 pub fn compile(source: &str, profile: Profile) -> Result<String> {
     let compiler = Compiler::new(profile);
